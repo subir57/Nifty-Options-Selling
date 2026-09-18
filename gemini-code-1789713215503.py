@@ -1,13 +1,6 @@
 """
 NSE Nifty 50 Single-Stock Short Strangle Backtesting Engine
-Framework: Streamlit, Pandas, NumPy, SciPy, Plotly, yfinance
-
-Strategy Mechanics:
-  1) Entry: 15th calendar day of Month M (or next valid trading session).
-  2) Sell 1 Lot Put at (X - y%) rounded to nearest exchange strike step (Month M+1 expiry).
-  3) Sell 1 Lot Call at (X + y%) rounded to nearest exchange strike step (Month M+1 expiry).
-  4) Exit: 15th calendar day of Month M+1 (or next valid trading session).
-  5) Includes transaction friction, statutory STT (0.1%), stop-loss thresholds, and margin tracking.
+Mobile & Desktop Optimized Architecture
 """
 
 import streamlit as st
@@ -21,20 +14,95 @@ from plotly.subplots import make_subplots
 import yfinance as yf
 
 # ---------------------------------------------------------
-# Page Configuration
+# Page Configuration & Viewport Optimization
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="NSE Stock Options Strangle Backtester",
-    page_icon="📊",
+    page_title="NSE Options Strangle Backtester",
+    page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="auto"
 )
+
+# ---------------------------------------------------------
+# Responsive Custom CSS Injection
+# ---------------------------------------------------------
+st.markdown("""
+<style>
+    /* Reduce default container padding on mobile */
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 2rem;
+        padding-left: 1rem;
+        padding-right: 1rem;
+    }
+    
+    @media (max-width: 768px) {
+        .block-container {
+            padding-top: 1rem;
+            padding-left: 0.5rem;
+            padding-right: 0.5rem;
+        }
+        h2 {
+            font-size: 1.4rem !important;
+        }
+        p {
+            font-size: 0.9rem !important;
+        }
+    }
+
+    /* Responsive KPI Metric Container */
+    .kpi-container {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        margin-bottom: 1.5rem;
+    }
+
+    .kpi-card {
+        flex: 1 1 calc(20% - 0.75rem);
+        min-width: 140px;
+        background-color: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 8px;
+        padding: 0.75rem 1rem;
+        box-sizing: border-box;
+    }
+
+    @media (max-width: 768px) {
+        .kpi-card {
+            flex: 1 1 calc(50% - 0.5rem);
+            min-width: 130px;
+            padding: 0.6rem 0.75rem;
+        }
+    }
+
+    .kpi-title {
+        font-size: 0.8rem;
+        color: #9E9E9E;
+        margin-bottom: 0.25rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    .kpi-value {
+        font-size: 1.3rem;
+        font-weight: 700;
+        color: #FFFFFF;
+    }
+
+    .kpi-sub {
+        font-size: 0.75rem;
+        color: #00CC96;
+        margin-top: 0.2rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------
 # Preset Nifty 50 Single-Stock F&O Specifications
 # ---------------------------------------------------------
 NIFTY_FNO_DIRECTORY = {
-    "RELIANCE.NS": {"name": "Reliance Industries Ltd", "lot": 250, "strike_step": 20.0},
+    "RELIANCE.NS": {"name": "Reliance Industries", "lot": 250, "strike_step": 20.0},
     "TCS.NS": {"name": "Tata Consultancy Services", "lot": 175, "strike_step": 50.0},
     "INFY.NS": {"name": "Infosys Ltd", "lot": 400, "strike_step": 20.0},
     "HDFCBANK.NS": {"name": "HDFC Bank Ltd", "lot": 550, "strike_step": 10.0},
@@ -47,20 +115,15 @@ NIFTY_FNO_DIRECTORY = {
 }
 
 # ---------------------------------------------------------
-# Calendar & Valuation Functions
+# Mathematical Valuation Engine
 # ---------------------------------------------------------
 def get_last_thursday(year: int, month: int) -> datetime.date:
-    """Calculates the standard monthly derivative expiry (last Thursday) on the NSE."""
     last_day = calendar.monthrange(year, month)[1]
     date_cursor = datetime.date(year, month, last_day)
     day_offset = (date_cursor.weekday() - 3) % 7
     return date_cursor - datetime.timedelta(days=day_offset)
 
 def black_scholes_price(S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> float:
-    """
-    Computes theoretical European option price via Black-Scholes-Merton formulation.
-    Handles T <= 0 boundaries through intrinsic value convergence.
-    """
     if T <= 0.0001:
         if option_type.lower() == 'call':
             return max(0.0, float(S - K))
@@ -79,7 +142,6 @@ def black_scholes_price(S: float, K: float, T: float, r: float, sigma: float, op
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_historical_stock_data(ticker: str, years: int = 3) -> pd.DataFrame:
-    """Fetches daily adjusted OHLCV data from Yahoo Finance with volatility padding."""
     end_date = datetime.date.today()
     start_date = end_date - datetime.timedelta(days=years * 365 + 120)
     
@@ -94,9 +156,6 @@ def fetch_historical_stock_data(ticker: str, years: int = 3) -> pd.DataFrame:
     cleaned_df.index = pd.to_datetime(cleaned_df.index).date
     return cleaned_df
 
-# ---------------------------------------------------------
-# Simulation Algorithm
-# ---------------------------------------------------------
 def execute_strangle_backtest(
     data: pd.DataFrame,
     y_pct: float,
@@ -109,7 +168,6 @@ def execute_strangle_backtest(
     transaction_cost_pct: float,
     lookback_years: int
 ):
-    """Executes the monthly mid-cycle short strangle strategy over the lookback horizon."""
     df = data.copy()
     df['Log_Return'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Realized_Vol'] = df['Log_Return'].rolling(window=vol_lookback).std() * np.sqrt(252)
@@ -158,7 +216,6 @@ def execute_strangle_backtest(
         exit_date = candidate_exits[0]
         
         contract_expiry = get_last_thursday(next_year, next_month)
-        
         S_entry = float(df.loc[entry_date, 'Close'])
         pricing_vol_entry = float(df.loc[entry_date, 'Realized_Vol']) * iv_multiplier
         
@@ -177,7 +234,7 @@ def execute_strangle_backtest(
         
         intermediate_dates = [d for d in trading_dates if entry_date < d <= exit_date]
         actual_exit_date = exit_date
-        exit_reason = "Scheduled Roll (15th)"
+        exit_reason = "Scheduled Roll"
         put_exit_prem = 0.0
         call_exit_prem = 0.0
         S_exit = float(df.loc[exit_date, 'Close'])
@@ -197,7 +254,7 @@ def execute_strangle_backtest(
                 S_exit = S_int
                 put_exit_prem = p_val
                 call_exit_prem = c_val
-                exit_reason = f"Stop Loss Trigger ({stop_loss_mult:.1f}x)"
+                exit_reason = f"Stop Loss ({stop_loss_mult:.1f}x)"
                 break
         else:
             pricing_vol_exit = float(df.loc[exit_date, 'Realized_Vol']) * iv_multiplier
@@ -208,14 +265,10 @@ def execute_strangle_backtest(
             
         final_debit = put_exit_prem + call_exit_prem
         gross_pnl_share = initial_credit - final_debit
-        
-        total_turnover = initial_credit + final_debit
-        frictional_deduction = total_turnover * (transaction_cost_pct / 100.0)
+        frictional_deduction = (initial_credit + final_debit) * (transaction_cost_pct / 100.0)
         net_pnl_share = gross_pnl_share - frictional_deduction
         total_cycle_pnl = net_pnl_share * lot_size
-        
-        gross_notional = S_entry * lot_size
-        allocated_margin = gross_notional * 0.22
+        allocated_margin = S_entry * lot_size * 0.22
         return_on_margin = (total_cycle_pnl / allocated_margin) * 100.0
         
         trade_ledger.append({
@@ -227,15 +280,11 @@ def execute_strangle_backtest(
             "Spot_Move_%": ((S_exit / S_entry) - 1.0) * 100.0,
             "Put_Strike": K_put,
             "Call_Strike": K_call,
-            "Put_Entry_Price": put_entry_prem,
-            "Call_Entry_Price": call_entry_prem,
-            "Total_Sold_Premium": initial_credit,
-            "Total_Closed_Premium": final_debit,
-            "Net_PnL_Per_Share": net_pnl_share,
-            "Total_Net_PnL": total_cycle_pnl,
-            "Margin_Allocated": allocated_margin,
-            "Return_On_Margin_%": return_on_margin,
-            "Exit_Mode": exit_reason
+            "Sold_Prem": initial_credit,
+            "Exit_Prem": final_debit,
+            "Net_PnL": total_cycle_pnl,
+            "ROM_%": return_on_margin,
+            "Exit_Reason": exit_reason
         })
         
         if curr_month == 12:
@@ -247,45 +296,41 @@ def execute_strangle_backtest(
     return pd.DataFrame(trade_ledger), df
 
 # ---------------------------------------------------------
-# Streamlit UI
+# Sidebar Controls
 # ---------------------------------------------------------
-st.markdown("<h2 style='text-align: left;'>NSE Nifty 50 Short Strangle Backtesting Engine</h2>", unsafe_allow_html=True)
-st.markdown(
-    "Quantitative testbed evaluating systematic 30-day rolling short strangles on Indian single-stock derivatives. "
-    "Trades enter on the 15th of month M and close on the 15th of month M+1, modeling discrete exchange strikes, "
-    "statutory STT, transaction costs, and physical delivery avoidance."
-)
-
-st.sidebar.header("Asset & Contract Selection")
+st.sidebar.header("Asset Selection")
 selected_symbol = st.sidebar.selectbox(
-    "Select Nifty 50 Constituent",
+    "Nifty 50 Constituent",
     options=list(NIFTY_FNO_DIRECTORY.keys()),
-    format_func=lambda x: f"{x} — {NIFTY_FNO_DIRECTORY[x]['name']}"
+    format_func=lambda x: f"{x.replace('.NS','')} — {NIFTY_FNO_DIRECTORY[x]['name']}"
 )
 
 configured_lot = NIFTY_FNO_DIRECTORY[selected_symbol]["lot"]
 configured_step = NIFTY_FNO_DIRECTORY[selected_symbol]["strike_step"]
 
-st.sidebar.subheader("Strategy Configuration")
-y_pct_slider = st.sidebar.slider("OTM Distance (y %)", min_value=1.0, max_value=15.0, value=5.0, step=0.5)
-strike_step_param = st.sidebar.number_input("NSE Strike Step (INR)", min_value=0.5, max_value=200.0, value=float(configured_step), step=1.0)
-lot_size_param = st.sidebar.number_input("Exchange Lot Size (Shares)", min_value=1, max_value=20000, value=int(configured_lot), step=25)
-lookback_years_param = st.sidebar.slider("Historical Window (Years)", min_value=1, max_value=4, value=3)
+with st.sidebar.expander("Strategy Parameters", expanded=True):
+    y_pct_slider = st.slider("OTM Distance (y %)", 1.0, 15.0, 5.0, 0.5)
+    strike_step_param = st.number_input("NSE Strike Step (₹)", 0.5, 200.0, float(configured_step), 1.0)
+    lot_size_param = st.number_input("Exchange Lot Size", 1, 20000, int(configured_lot), 25)
+    lookback_years_param = st.slider("Lookback (Years)", 1, 4, 3)
 
-st.sidebar.subheader("Risk & Cost Parameters")
-iv_markup_param = st.sidebar.slider("IV / Realized Vol Multiplier", min_value=1.0, max_value=1.40, value=1.15, step=0.01)
-rf_rate_param = st.sidebar.slider("Indian Risk-Free Rate (%)", min_value=4.0, max_value=9.0, value=6.75, step=0.25) / 100.0
-stop_loss_param = st.sidebar.slider("Stop Loss Multiple (x Credit, 0 = Off)", min_value=0.0, max_value=4.0, value=2.5, step=0.5)
-friction_param = st.sidebar.slider("Friction & Taxes (% of Premium)", min_value=0.0, max_value=3.0, value=1.2, step=0.1)
+with st.sidebar.expander("Risk & Tax Rules", expanded=False):
+    iv_markup_param = st.slider("IV Markup Multiplier", 1.0, 1.40, 1.15, 0.01)
+    rf_rate_param = st.slider("Risk-Free Rate (%)", 4.0, 9.0, 6.75, 0.25) / 100.0
+    stop_loss_param = st.slider("Stop Loss Multiple (x)", 0.0, 4.0, 2.5, 0.5)
+    friction_param = st.slider("STT & Friction (%)", 0.0, 3.0, 1.2, 0.1)
 
 # ---------------------------------------------------------
-# Execution & Analytics
+# Simulation Processing
 # ---------------------------------------------------------
-with st.spinner(f"Fetching data and running backtest for {selected_symbol}..."):
+st.markdown("## Nifty 50 Short Strangle Engine")
+st.caption("30-day mid-cycle options harvesting with systematic mid-month rolls.")
+
+with st.spinner("Analyzing historical option cycles..."):
     stock_history = fetch_historical_stock_data(selected_symbol, years=lookback_years_param)
 
 if stock_history.empty:
-    st.error(f"Failed to fetch market data for {selected_symbol}. Please check connection or ticker validity.")
+    st.error("Market data unavailable. Please verify connection.")
     st.stop()
 
 ledger_df, enriched_stock_df = execute_strangle_backtest(
@@ -302,60 +347,93 @@ ledger_df, enriched_stock_df = execute_strangle_backtest(
 )
 
 if ledger_df.empty:
-    st.warning("Insufficient data generated across the selected lookback range.")
+    st.warning("No complete cycles generated for the selected lookback.")
     st.stop()
 
-ledger_df['Cumulative_PnL'] = ledger_df['Total_Net_PnL'].cumsum()
+# Performance Metrics Calculation
+ledger_df['Cumulative_PnL'] = ledger_df['Net_PnL'].cumsum()
 ledger_df['Peak_PnL'] = ledger_df['Cumulative_PnL'].cummax()
 ledger_df['Drawdown_INR'] = ledger_df['Cumulative_PnL'] - ledger_df['Peak_PnL']
 
-total_executions = len(ledger_df)
-winning_executions = len(ledger_df[ledger_df['Total_Net_PnL'] > 0])
-win_rate_pct = (winning_executions / total_executions) * 100.0 if total_executions > 0 else 0.0
-net_cumulative_profit = ledger_df['Total_Net_PnL'].sum()
+total_cycles = len(ledger_df)
+winning_cycles = len(ledger_df[ledger_df['Net_PnL'] > 0])
+win_rate = (winning_cycles / total_cycles) * 100.0
+cumulative_net_pnl = ledger_df['Net_PnL'].sum()
 
-gross_wins = ledger_df[ledger_df['Total_Net_PnL'] > 0]['Total_Net_PnL'].sum()
-gross_losses = abs(ledger_df[ledger_df['Total_Net_PnL'] < 0]['Total_Net_PnL'].sum())
+gross_wins = ledger_df[ledger_df['Net_PnL'] > 0]['Net_PnL'].sum()
+gross_losses = abs(ledger_df[ledger_df['Net_PnL'] < 0]['Net_PnL'].sum())
 profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else np.nan
-peak_drawdown = abs(ledger_df['Drawdown_INR'].min())
-mean_margin = ledger_df['Margin_Allocated'].mean()
-annualized_rom = (net_cumulative_profit / mean_margin) / lookback_years_param * 100.0 if mean_margin > 0 else 0.0
+max_dd = abs(ledger_df['Drawdown_INR'].min())
 
 # ---------------------------------------------------------
-# Dashboard Display
+# Responsive KPI Cards
 # ---------------------------------------------------------
-st.markdown("### Strategy Performance Overview")
-kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-kpi1.metric("Cumulative Net PnL", f"₹{net_cumulative_profit:,.0f}")
-kpi2.metric("Win Rate", f"{win_rate_pct:.1f}%", f"{winning_executions}/{total_executions} Wins")
-kpi3.metric("Profit Factor", f"{profit_factor:.2f}" if not np.isnan(profit_factor) else "N/A")
-kpi4.metric("Max Strategy Drawdown", f"₹{peak_drawdown:,.0f}")
-kpi5.metric("Annualized Return on Margin", f"{annualized_rom:.1f}%")
+pnl_color = "#00CC96" if cumulative_net_pnl >= 0 else "#EF553B"
 
-st.markdown("---")
+st.markdown(f"""
+<div class="kpi-container">
+    <div class="kpi-card">
+        <div class="kpi-title">Net Profit</div>
+        <div class="kpi-value" style="color: {pnl_color};">₹{cumulative_net_pnl:,.0f}</div>
+        <div class="kpi-sub">{total_cycles} Total Cycles</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-title">Win Rate</div>
+        <div class="kpi-value">{win_rate:.1f}%</div>
+        <div class="kpi-sub">{winning_cycles} Wins / {total_cycles - winning_cycles} Losses</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-title">Profit Factor</div>
+        <div class="kpi-value">{"N/A" if np.isnan(profit_factor) else f"{profit_factor:.2f}"}</div>
+        <div class="kpi-sub">Win/Loss Ratio</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-title">Max Drawdown</div>
+        <div class="kpi-value" style="color: #EF553B;">₹{max_dd:,.0f}</div>
+        <div class="kpi-sub">Peak-to-Trough</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-tab_equity, tab_cycles, tab_underlying = st.tabs(["Equity Curve & Drawdowns", "Cycle Distribution", "Price Action vs. Strikes"])
+# ---------------------------------------------------------
+# Interactive Plotly Views (Touch & Desktop Friendly)
+# ---------------------------------------------------------
+tab1, tab2, tab3 = st.tabs(["📊 Equity Curve", "📅 Cycle PnL", "📋 Audit Ledger"])
 
-with tab_equity:
-    fig_curve = make_subplots(
+plotly_layout_defaults = dict(
+    template='plotly_dark',
+    autosize=True,
+    margin=dict(l=10, r=10, t=30, b=20),
+    legend=dict(
+        orientation="h",
+        yanchor="bottom",
+        y=1.02,
+        xanchor="right",
+        x=1,
+        font=dict(size=10)
+    ),
+    hovermode="x unified"
+)
+
+with tab1:
+    fig_equity = make_subplots(
         rows=2, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.08,
-        subplot_titles=("Cumulative Net Strategy Realized Profit (INR)", "Underwater Strategy Drawdown (INR)"),
+        vertical_spacing=0.06,
         row_heights=[0.7, 0.3]
     )
-    fig_curve.add_trace(
+    fig_equity.add_trace(
         go.Scatter(
             x=ledger_df['Exit_Date'],
             y=ledger_df['Cumulative_PnL'],
             mode='lines+markers',
-            name='Net Cumulative PnL',
-            line=dict(color='#00CC96', width=2.5),
-            marker=dict(size=6)
+            name='Cumulative PnL',
+            line=dict(color='#00CC96', width=2),
+            marker=dict(size=5)
         ),
         row=1, col=1
     )
-    fig_curve.add_trace(
+    fig_equity.add_trace(
         go.Scatter(
             x=ledger_df['Exit_Date'],
             y=ledger_df['Drawdown_INR'],
@@ -363,118 +441,62 @@ with tab_equity:
             name='Drawdown',
             fill='tozeroy',
             line=dict(color='#EF553B', width=1.5),
-            fillcolor='rgba(239, 85, 59, 0.2)'
+            fillcolor='rgba(239, 85, 59, 0.25)'
         ),
         row=2, col=1
     )
-    fig_curve.update_layout(height=520, template='plotly_dark', margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
-    st.plotly_chart(fig_curve, use_container_width=True)
+    fig_equity.update_layout(**plotly_layout_defaults, height=420)
+    fig_equity.update_yaxes(title_text="PnL (₹)", row=1, col=1)
+    fig_equity.update_yaxes(title_text="DD (₹)", row=2, col=1)
+    st.plotly_chart(fig_equity, use_container_width=True, config={'displayModeBar': False, 'responsive': True})
 
-with tab_cycles:
-    cycle_colors = ['#00CC96' if pnl > 0 else '#EF553B' for pnl in ledger_df['Total_Net_PnL']]
+with tab2:
+    colors = ['#00CC96' if x > 0 else '#EF553B' for x in ledger_df['Net_PnL']]
     fig_bar = go.Figure(
         data=[
             go.Bar(
                 x=ledger_df['Exit_Date'],
-                y=ledger_df['Total_Net_PnL'],
-                marker_color=cycle_colors,
-                text=[f"₹{pnl:,.0f}" for pnl in ledger_df['Total_Net_PnL']],
-                textposition='auto'
+                y=ledger_df['Net_PnL'],
+                marker_color=colors,
+                hovertemplate="Exit: %{x}<br>Net PnL: ₹%{y:,.0f}<extra></extra>"
             )
         ]
     )
-    fig_bar.update_layout(
-        title="Cycle-by-Cycle Net Realized Profit/Loss (INR)",
-        xaxis_title="Roll Exit Date",
-        yaxis_title="Net PnL (INR)",
-        height=450,
-        template='plotly_dark',
-        margin=dict(l=20, r=20, t=50, b=20)
-    )
-    st.plotly_chart(fig_bar, use_container_width=True)
+    fig_bar.update_layout(**plotly_layout_defaults, height=360)
+    fig_bar.update_yaxes(title_text="Net PnL (₹)")
+    st.plotly_chart(fig_bar, use_container_width=True, config={'displayModeBar': False, 'responsive': True})
 
-with tab_underlying:
-    fig_scatter = go.Figure()
-    fig_scatter.add_trace(
-        go.Scatter(
-            x=enriched_stock_df.index,
-            y=enriched_stock_df['Close'],
-            mode='lines',
-            name='Stock Close',
-            line=dict(color='#636EFA', width=1.5)
-        )
-    )
-    fig_scatter.add_trace(
-        go.Scatter(
-            x=ledger_df['Entry_Date'],
-            y=ledger_df['Call_Strike'],
-            mode='markers',
-            name='Sold Call Strike',
-            marker=dict(symbol='triangle-up', size=8, color='#FFA15A')
-        )
-    )
-    fig_scatter.add_trace(
-        go.Scatter(
-            x=ledger_df['Entry_Date'],
-            y=ledger_df['Put_Strike'],
-            mode='markers',
-            name='Sold Put Strike',
-            marker=dict(symbol='triangle-down', size=8, color='#AB63FA')
-        )
-    )
-    fig_scatter.update_layout(
-        title=f"{selected_symbol} Spot Trajectory vs. Strangle Strike Grid",
-        xaxis_title="Date",
-        yaxis_title="Stock Price (INR)",
-        height=480,
-        template='plotly_dark',
-        margin=dict(l=20, r=20, t=50, b=20)
-    )
-    st.plotly_chart(fig_scatter, use_container_width=True)
+with tab3:
+    # Modern st.dataframe with responsive column formatting
+    display_df = ledger_df[[
+        "Entry_Date", "Exit_Date", "Spot_Entry", "Spot_Exit", "Spot_Move_%",
+        "Put_Strike", "Call_Strike", "Sold_Prem", "Exit_Prem", "Net_PnL", "ROM_%", "Exit_Reason"
+    ]].copy()
 
-# ---------------------------------------------------------
-# Audit Ledger
-# ---------------------------------------------------------
-st.markdown("### Execution Audit Ledger")
-view_df = ledger_df[[
-    "Entry_Date", "Exit_Date", "Spot_Entry", "Spot_Exit", "Spot_Move_%",
-    "Put_Strike", "Call_Strike", "Total_Sold_Premium", "Total_Closed_Premium",
-    "Net_PnL_Per_Share", "Total_Net_PnL", "Return_On_Margin_%", "Exit_Mode"
-]].copy()
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Entry_Date": st.column_config.DateColumn("Entry Date", format="YYYY-MM-DD"),
+            "Exit_Date": st.column_config.DateColumn("Exit Date", format="YYYY-MM-DD"),
+            "Spot_Entry": st.column_config.NumberColumn("Entry Spot", format="₹%.2f"),
+            "Spot_Exit": st.column_config.NumberColumn("Exit Spot", format="₹%.2f"),
+            "Spot_Move_%": st.column_config.NumberColumn("Move", format="%+.1f%%"),
+            "Put_Strike": st.column_config.NumberColumn("Put (K)", format="%.0f"),
+            "Call_Strike": st.column_config.NumberColumn("Call (K)", format="%.0f"),
+            "Sold_Prem": st.column_config.NumberColumn("Sold ₹", format="₹%.1f"),
+            "Exit_Prem": st.column_config.NumberColumn("Exit ₹", format="₹%.1f"),
+            "Net_PnL": st.column_config.NumberColumn("Net PnL", format="₹%.0f"),
+            "ROM_%": st.column_config.NumberColumn("ROM", format="%+.1f%%"),
+            "Exit_Reason": st.column_config.TextColumn("Trigger")
+        }
+    )
 
-view_df.rename(columns={
-    "Spot_Entry": "Entry Spot",
-    "Spot_Exit": "Exit Spot",
-    "Spot_Move_%": "Move %",
-    "Put_Strike": "Put Strike",
-    "Call_Strike": "Call Strike",
-    "Total_Sold_Premium": "Sold Prem",
-    "Total_Closed_Premium": "Exit Prem",
-    "Net_PnL_Per_Share": "Net PnL/Sh",
-    "Total_Net_PnL": "Net PnL (₹)",
-    "Return_On_Margin_%": "ROM %",
-    "Exit_Mode": "Trigger"
-}, inplace=True)
-
-st.dataframe(
-    view_df.style.format({
-        "Entry Spot": "₹{:.2f}",
-        "Exit Spot": "₹{:.2f}",
-        "Move %": "{:+.2f}%",
-        "Put Strike": "{:.1f}",
-        "Call Strike": "{:.1f}",
-        "Sold Prem": "₹{:.2f}",
-        "Exit Prem": "₹{:.2f}",
-        "Net PnL/Sh": "₹{:.2f}",
-        "Net PnL (₹)": "₹{:,.2f}",
-        "ROM %": "{:+.2f}%"
-    }),
-    use_container_width=True
-)
-
-st.download_button(
-    label="Download Audit Ledger CSV",
-    data=ledger_df.to_csv(index=False).encode('utf-8'),
-    file_name=f"{selected_symbol}_strangle_audit.csv",
-    mime="text/csv"
-)
+    st.download_button(
+        label="📥 Download Audit Ledger (CSV)",
+        data=ledger_df.to_csv(index=False).encode('utf-8'),
+        file_name=f"{selected_symbol}_strangle_audit.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
