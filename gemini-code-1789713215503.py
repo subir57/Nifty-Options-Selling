@@ -142,7 +142,7 @@ div[data-testid="stTabs"] button {{
 .tick .v {{font-size:.85rem;font-weight:800;margin-top:2px;}}
 .tick .s {{font-size:.60rem;color:#667181;margin-top:1px;}}
 .kpi-grid {{
-    display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:9px;margin:5px 0 13px;
+    display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:9px;margin:5px 0 13px;
 }}
 .kpi {{
     min-height:95px;padding:12px 13px;border-radius:12px;
@@ -623,7 +623,8 @@ kpis = [
     ("WIN RATE", pct(metrics["win_rate"]), "positive cycles"),
     ("PROFIT FACTOR", f"{metrics['profit_factor']:.2f}" if np.isfinite(metrics["profit_factor"]) else "—", "gross wins / losses"),
     ("MAX DRAWDOWN", money(metrics["max_dd"]), "cycle equity"),
-    ("AVG ROM", pct(metrics["avg_rom"]), "return on margin"),
+    ("AVG ROM", pct(metrics["avg_rom"]), "return on margin / cycle"),
+    ("ANNUALIZED ROM", pct(metrics["annualized_rom"]), "annualized return on avg margin"),
     ("SHARPE", f"{metrics['sharpe']:.2f}" if np.isfinite(metrics["sharpe"]) else "—", "monthly-cycle basis"),
 ]
 html = '<div class="kpi-grid">'
@@ -764,11 +765,12 @@ with tabs[0]:
 
 with tabs[1]:
     st.markdown('<div class="section">Risk Dashboard</div>', unsafe_allow_html=True)
-    r1,r2,r3,r4 = st.columns(4)
+    r1,r2,r3,r4,r5 = st.columns(5)
     r1.metric("Max Drawdown",money(metrics["max_dd"]))
     r2.metric("Worst Cycle",money(metrics["worst"]))
     r3.metric("Stop Rate",pct(metrics["stop_rate"]))
-    r4.metric("Sortino",f"{metrics['sortino']:.2f}" if np.isfinite(metrics["sortino"]) else "—")
+    r4.metric("Annualized ROM",pct(metrics["annualized_rom"]))
+    r5.metric("Sortino",f"{metrics['sortino']:.2f}" if np.isfinite(metrics["sortino"]) else "—")
 
     c1,c2 = st.columns(2)
     with c1:
