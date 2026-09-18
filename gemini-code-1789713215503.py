@@ -7,18 +7,14 @@ Run:
     pip install streamlit pandas numpy scipy plotly yfinance requests
     streamlit run nse_strangle_v2.py
 
-Data modes
-----------
-1. Historical NSE option CSV:
-   Upload a contract-wise NSE historical options CSV exported from:
-   NSE -> Historical Contract-wise Price Volume Data.
-   The parser accepts common column aliases for date, symbol, expiry,
-   option type, strike and close/settlement price.
-
-2. Theoretical fallback:
-   Uses Yahoo Finance spot data + Black-Scholes + rolling realized volatility.
-   This is clearly labelled "THEORETICAL" and should not be confused with
-   an execution-grade historical option backtest.
+Data source
+-----------
+NSE India direct data only. The dashboard does not require file uploads and
+does not use Yahoo Finance or Black-Scholes prices for the production path.
+Historical equity prices are fetched from NSE's historical equity endpoint;
+historical stock-option prices are fetched contract-by-contract from NSE's
+historical F&O endpoint. NSE contract metadata (lot size and strike scheme)
+is also downloaded directly from NSE.
 
 Important
 ---------
@@ -34,6 +30,8 @@ import io
 import math
 import calendar
 import datetime as dt
+import time
+import requests
 
 import numpy as np
 import pandas as pd
@@ -41,7 +39,6 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.stats import norm
-import yfinance as yf
 
 
 # ============================================================
@@ -413,6 +410,366 @@ def parse_nse_csv(uploaded):
     out = out[out["OptionType"].isin(["CE","PE"])]
 
     return out.sort_values(["Date","Expiry","Strike"])
+
+
+
+# ============================================================
+# NSE DIRECT DATA ENGINE
+# ============================================================
+
+NSE_BASE = "https://www.nseindia.com"
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-IN,en;q=0.9,en-US;q=0.8",
+    "Referer": "https://www.nseindia.com/report-detail/fo_eq_security",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
+def _nse_session():
+    s = requests.Session()
+    s.headers.update(NSE_HEADERS)
+    # NSE expects a normal page visit before API requests so that session
+    # cookies are established.
+    s.get(f"{NSE_BASE}/report-detail/fo_eq_security", timeout=20)
+    return s
+
+
+@st.cache_resource(show_spinner=False)
+def nse_http_session():
+    return _nse_session()
+
+
+def _nse_get_json(url, params=None, retries=3):
+    last = None
+    for attempt in range(retries):
+        try:
+            r = nse_http_session().get(url, params=params, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (401, 403, 429):
+                # Refresh cookies once and back off. NSE can throttle bursts.
+                nse_http_session().get(f"{NSE_BASE}/", timeout=20)
+            last = RuntimeError(f"NSE HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            last = e
+        time.sleep(1.5 * (attempt + 1))
+    raise last or RuntimeError("NSE request failed")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def nse_equity_history(symbol, start_date, end_date):
+    """Daily NSE cash-market OHLC for one symbol."""
+    url = f"{NSE_BASE}/api/historicalOR/generateSecurityWiseHistoricalData"
+    params = {
+        "from": start_date.strftime("%d-%m-%Y"),
+        "to": end_date.strftime("%d-%m-%Y"),
+        "symbol": symbol,
+        "type": "priceVolumeDeliverable",
+        "series": "EQ",
+        "csv": "true",
+    }
+    payload = _nse_get_json(url, params)
+    rows = payload.get("data", payload) if isinstance(payload, dict) else payload
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    def col(*names):
+        return find_column(df, list(names))
+
+    d = col("Date", "CH_TIMESTAMP", "mTIMESTAMP", "timestamp")
+    c = col("Close", "CH_CLOSING_PRICE", "close")
+    if d is None or c is None:
+        return pd.DataFrame()
+    out = pd.DataFrame({
+        "Date": pd.to_datetime(df[d], errors="coerce", dayfirst=True).dt.date,
+        "Close": pd.to_numeric(df[c], errors="coerce"),
+    }).dropna()
+    return out.sort_values("Date").drop_duplicates("Date")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def nse_contract_metadata():
+    """Download NSE's current permitted lot-size and strike-scheme files."""
+    out = {"lots": {}, "strikes": pd.DataFrame(), "status": "OK"}
+    try:
+        lot_url = "https://archives.nseindia.com/content/fo/fo_mktlots.csv"
+        lot_df = pd.read_csv(lot_url)
+        if lot_df.shape[1] >= 2:
+            # NSE file has symbol and market-lot fields; use robust aliases.
+            sc = find_column(lot_df, ["SYMBOL", "Symbol", "Underlying", "CODE"])
+            lc = find_column(lot_df, ["MARKET LOT", "Market Lot", "LOT SIZE", "Lot Size"])
+            if sc is not None and lc is not None:
+                out["lots"] = dict(zip(
+                    lot_df[sc].astype(str).str.upper().str.strip(),
+                    pd.to_numeric(lot_df[lc], errors="coerce").fillna(1).astype(int)
+                ))
+    except Exception as e:
+        out["status"] = f"Lot file unavailable: {e}"
+
+    try:
+        strike_url = "https://archives.nseindia.com/content/fo/NSE_FO_SosScheme.csv"
+        strike_df = pd.read_csv(strike_url)
+        strike_df.columns = [str(c).strip() for c in strike_df.columns]
+        out["strikes"] = strike_df
+    except Exception as e:
+        if out["status"] == "OK":
+            out["status"] = f"Strike scheme unavailable: {e}"
+    return out
+
+
+def _step_from_scheme(symbol, month_type="Near Month", fallback=5.0):
+    meta = nse_contract_metadata()
+    df = meta.get("strikes", pd.DataFrame())
+    if df.empty:
+        return fallback
+    sc = find_column(df, ["Symbol", "SYMBOL"])
+    mc = find_column(df, ["Month type", "Month Type", "MONTH TYPE"])
+    vc = find_column(df, ["Step Value", "Step value", "STEP VALUE"])
+    if sc is None or vc is None:
+        return fallback
+    x = df[df[sc].astype(str).str.upper().str.strip().eq(symbol.upper())].copy()
+    if mc is not None:
+        m = x[x[mc].astype(str).str.strip().str.lower().eq(month_type.lower())]
+        if not m.empty:
+            x = m
+    if x.empty:
+        return fallback
+    v = pd.to_numeric(x[vc], errors="coerce").dropna()
+    return float(v.iloc[0]) if not v.empty else fallback
+
+
+def _nearest_strike(target, step):
+    step = max(float(step), 0.05)
+    return round(round(float(target) / step) * step, 2)
+
+
+def _expiry_for_month(year, month, trading_dates):
+    """Last Tuesday of month, shifted back to the previous NSE trading day."""
+    last_day = calendar.monthrange(year, month)[1]
+    d = dt.date(year, month, last_day)
+    while d.weekday() != 1:
+        d -= dt.timedelta(days=1)
+    dates = set(trading_dates)
+    while d not in dates and d >= dt.date(year, month, 1):
+        d -= dt.timedelta(days=1)
+    return d
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def nse_option_history(symbol, expiry, option_type, strike, start_date, end_date):
+    """Actual NSE daily contract-wise OHLC/OI for one OPTSTK contract."""
+    url = f"{NSE_BASE}/api/historicalOR/foCPV"
+    params = {
+        "from": start_date.strftime("%d-%m-%Y"),
+        "to": end_date.strftime("%d-%m-%Y"),
+        "instrumentType": "OPTSTK",
+        "symbol": symbol,
+        "year": str(expiry.year),
+        "expiryDate": expiry.strftime("%d-%b-%Y").upper(),
+        "optionType": option_type,
+        "strikePrice": f"{strike:g}",
+    }
+    payload = _nse_get_json(url, params)
+    rows = payload.get("data", []) if isinstance(payload, dict) else payload
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    dc = find_column(df, ["Date", "Trade Date", "TIMESTAMP", "CH_TIMESTAMP", "timestamp"])
+    cc = find_column(df, ["Close Price", "CLOSE", "Close", "CH_CLOSING_PRICE", "close"])
+    if dc is None or cc is None:
+        return pd.DataFrame()
+    out = pd.DataFrame({
+        "Date": pd.to_datetime(df[dc], errors="coerce", dayfirst=True).dt.date,
+        "Close": pd.to_numeric(df[cc], errors="coerce"),
+    })
+    # Preserve observed lot size if NSE returns it in the contract data.
+    lc = find_column(df, ["Market Lot", "MARKET LOT", "marketLot", "MarketLot"])
+    if lc is not None:
+        out["MarketLot"] = pd.to_numeric(df[lc], errors="coerce")
+    else:
+        out["MarketLot"] = np.nan
+    return out.dropna(subset=["Date", "Close"]).sort_values("Date").drop_duplicates("Date")
+
+
+def _fetch_contract_with_fallback(symbol, expiry, option_type, target_strike, start_date, end_date, step):
+    # Historical strike schemes can differ after quarterly reviews. Try the
+    # model-selected strike plus nearby NSE intervals and use the first actual
+    # contract returned by NSE. This avoids inventing an option price.
+    candidates = []
+    base = _nearest_strike(target_strike, step)
+    for k in range(0, 5):
+        if k == 0:
+            candidates.append(base)
+        else:
+            candidates.extend([round(base + k*step, 2), round(base - k*step, 2)])
+    seen = set()
+    for strike in candidates:
+        if strike in seen or strike <= 0:
+            continue
+        seen.add(strike)
+        try:
+            df = nse_option_history(symbol, expiry, option_type, strike, start_date, end_date)
+            if not df.empty:
+                return strike, df
+        except Exception:
+            continue
+    return np.nan, pd.DataFrame()
+
+
+def nse_actual_backtest(symbol, years, y_pct, stop_mult, friction, margin_pct):
+    """Execution-style daily-close backtest using observed NSE option prices."""
+    end = dt.date.today()
+    start = dt.date(end.year - years, end.month, end.day)
+    spot = nse_equity_history(symbol, start, end)
+    if spot.empty:
+        return pd.DataFrame(), "No NSE equity history"
+    spot_map = dict(zip(spot["Date"], spot["Close"]))
+    trading_dates = sorted(spot_map)
+    if len(trading_dates) < 40:
+        return pd.DataFrame(), "Insufficient NSE equity history"
+
+    meta = nse_contract_metadata()
+    default_lot = int(meta.get("lots", {}).get(symbol.upper(), FNO.get(symbol, {}).get("lot", 1)))
+    step = _step_from_scheme(symbol, fallback=FNO.get(symbol, {}).get("step", 5.0))
+
+    cycles = []
+    # Calendar months whose 15th has a later trading date in the sample.
+    months = sorted(set((d.year, d.month) for d in trading_dates))
+    for y, m in months[:-1]:
+        entry_target = dt.date(y, m, 15)
+        entry_candidates = [d for d in trading_dates if d >= entry_target and d.year == y and d.month == m]
+        if not entry_candidates:
+            continue
+        entry_date = entry_candidates[0]
+
+        # Next calendar month
+        nm = 1 if m == 12 else m + 1
+        ny = y + 1 if m == 12 else y
+        exit_target = dt.date(ny, nm, 15)
+        exit_candidates = [d for d in trading_dates if d >= exit_target and d.year == ny and d.month == nm]
+        if not exit_candidates:
+            continue
+        planned_exit = exit_candidates[0]
+        expiry = _expiry_for_month(ny, nm, trading_dates)
+        if expiry is None or expiry <= entry_date:
+            continue
+        exit_date = min(planned_exit, expiry)
+        exit_candidates2 = [d for d in trading_dates if entry_date <= d <= exit_date]
+        if not exit_candidates2:
+            continue
+
+        S = float(spot_map[entry_date])
+        put_target = S * (1 - y_pct/100)
+        call_target = S * (1 + y_pct/100)
+        # Use the applicable near-month step from NSE's current strike scheme;
+        # historical contract fallback prevents synthetic prices.
+        pstrike, put = _fetch_contract_with_fallback(
+            symbol, expiry, "PE", put_target, entry_date, exit_date, step
+        )
+        cstrike, call = _fetch_contract_with_fallback(
+            symbol, expiry, "CE", call_target, entry_date, exit_date, step
+        )
+        if put.empty or call.empty:
+            continue
+
+        p = put.set_index("Date")["Close"].rename("Put")
+        c = call.set_index("Date")["Close"].rename("Call")
+        path = pd.concat([p, c], axis=1).dropna()
+        if path.empty or entry_date not in path.index:
+            continue
+        path = path[(path.index >= entry_date) & (path.index <= exit_date)]
+        if path.empty:
+            continue
+
+        entry_credit = float(path.loc[entry_date, "Put"] + path.loc[entry_date, "Call"])
+        if entry_credit <= 0:
+            continue
+        stop_level = entry_credit * stop_mult if stop_mult > 0 else np.inf
+        stop_date = None
+        for d, r in path.iterrows():
+            if d <= entry_date:
+                continue
+            if float(r["Put"] + r["Call"]) >= stop_level:
+                stop_date = d
+                break
+        if stop_date is not None:
+            actual_exit = stop_date
+            exit_reason = "Stop Loss"
+        else:
+            actual_exit = path.index[-1]
+            exit_reason = "Scheduled / Expiry"
+        exit_credit = float(path.loc[actual_exit, "Put"] + path.loc[actual_exit, "Call"])
+        lot = default_lot
+        observed_lots = pd.concat([put, call])["MarketLot"].dropna()
+        if not observed_lots.empty:
+            lot = int(observed_lots.mode().iloc[0])
+
+        gross = (entry_credit - exit_credit) * lot
+        turnover = (entry_credit + exit_credit) * lot
+        costs = turnover * friction/100
+        net = gross - costs
+        margin = max(S * lot * margin_pct/100, 1.0)
+        rom = net / margin * 100
+        spot_exit = float(spot_map.get(actual_exit, np.nan))
+        cycles.append({
+            "Symbol": symbol,
+            "Entry": entry_date,
+            "Exit": actual_exit,
+            "Entry_Date": entry_date,
+            "Exit_Date": actual_exit,
+            "Expiry": expiry,
+            "Put_Strike": pstrike,
+            "Call_Strike": cstrike,
+            "Entry_Spot": S,
+            "Exit_Spot": spot_exit,
+            "Sold_Prem": entry_credit * lot,
+            "Exit_Prem": exit_credit * lot,
+            "Gross_PnL": gross,
+            "Costs": costs,
+            "Net_PnL": net,
+            "Margin": margin,
+            "Allocated_Margin": margin,
+            "ROM_%": rom,
+            "Exit_Reason": exit_reason,
+            "Days_Held": (actual_exit-entry_date).days,
+        })
+    return pd.DataFrame(cycles), "OK" if cycles else "No complete NSE option cycles"
+
+
+def run_all_nifty50_nse(symbols, years, y_pct, stop_mult, friction, margin_pct, progress=None):
+    rows = []
+    for i, sym in enumerate(symbols, 1):
+        try:
+            ledger, status = nse_actual_backtest(sym, years, y_pct, stop_mult, friction, margin_pct)
+            if ledger.empty:
+                rows.append({"Symbol": sym, "Status": status, "Cycles": 0})
+            else:
+                pnl = ledger["Net_PnL"]
+                wins = pnl > 0
+                rows.append({
+                    "Symbol": sym, "Status": "OK", "Cycles": len(ledger),
+                    "Win_Rate_%": wins.mean()*100,
+                    "Net_PnL": pnl.sum(),
+                    "Avg_PnL": pnl.mean(),
+                    "Median_PnL": pnl.median(),
+                    "Profit_Factor": pnl[pnl>0].sum()/abs(pnl[pnl<0].sum()) if (pnl<0).any() else np.inf,
+                    "Avg_ROM_%": ledger["ROM_%"].mean(),
+                    "Max_DD": (ledger["Net_PnL"].cumsum()-ledger["Net_PnL"].cumsum().cummax()).min(),
+                    "Stop_Rate_%": (ledger["Exit_Reason"].eq("Stop Loss").mean()*100),
+                })
+        except Exception as e:
+            rows.append({"Symbol": sym, "Status": f"ERROR: {str(e)[:120]}", "Cycles": 0})
+        if progress:
+            progress(i, len(symbols), sym)
+    out = pd.DataFrame(rows)
+    if not out.empty and "Win_Rate_%" in out:
+        out["Win_Rate_Rank"] = out["Win_Rate_%"].rank(method="min", ascending=False).astype("Int64")
+        out = out.sort_values(["Status", "Win_Rate_%"], ascending=[True, False])
+    return out
 
 
 # ============================================================
@@ -796,8 +1153,8 @@ with universe_tab:
         "Cross-sectional comparison uses the same strategy parameters for "
         "all constituents. Results are normalized to one unit of notional, "
         "so win rate is directly comparable across stocks. This is the "
-        "theoretical Black-Scholes engine unless historical option CSV data "
-        "is supplied and a historical-option execution layer is enabled."
+        "actual NSE contract-wise historical option prices. No upload, Yahoo "
+        "prices or Black-Scholes option estimates are used."
     )
 
     run_batch = st.button(
@@ -812,12 +1169,10 @@ with universe_tab:
             with st.spinner(
                 "Running the strategy across all 50 Nifty constituents..."
             ):
-                st.session_state["nifty50_comparison"] = run_all_nifty50(
+                st.session_state["nifty50_comparison"] = run_all_nifty50_nse(
                     symbols=list(FNO.keys()),
                     years=years,
                     y_pct=y_pct,
-                    rf=rf,
-                    iv_markup=iv_markup,
                     stop_mult=stop_mult,
                     friction=friction,
                     margin_pct=margin_pct,
@@ -832,7 +1187,7 @@ with universe_tab:
         if ok.empty:
             st.error(
                 "No constituent completed successfully. "
-                "Check Yahoo Finance connectivity."
+                "Check NSE connectivity, NSE rate limits, and the selected lookback window."
             )
         else:
 
@@ -920,86 +1275,32 @@ with universe_tab:
                 config={"displayModeBar": False},
             )
 
-            # Secondary comparison: win rate + ROM + Sharpe.
+            # Secondary comparison: all metrics available from NSE runs.
             st.markdown(
                 '<div class="section">Cross-Sectional Metrics</div>',
                 unsafe_allow_html=True,
             )
 
-            shown = comp[
-                [
-                    "Win_Rate_Rank",
-                    "Symbol",
-                    "Company",
-                    "Cycles",
-                    "Win_Rate_%",
-                    "Avg_ROM_%",
-                    "Median_ROM_%",
-                    "Annualized_ROM_%",
-                    "Profit_Factor",
-                    "Sharpe",
-                    "Sortino",
-                    "Max_Drawdown_Normalized",
-                    "Stop_Rate_%",
-                    "Status",
-                ]
-            ].copy()
-
+            shown_cols = [
+                "Win_Rate_Rank", "Symbol", "Cycles", "Win_Rate_%",
+                "Net_PnL", "Avg_PnL", "Median_PnL", "Profit_Factor",
+                "Avg_ROM_%", "Max_DD", "Stop_Rate_%", "Status"
+            ]
+            shown = comp[[c for c in shown_cols if c in comp.columns]].copy()
             st.dataframe(
                 shown,
                 use_container_width=True,
                 height=650,
                 column_config={
-                    "Win_Rate_Rank":
-                        st.column_config.NumberColumn(
-                            "Win Rank",
-                            format="%d",
-                        ),
-                    "Win_Rate_%":
-                        st.column_config.NumberColumn(
-                            "Win Rate",
-                            format="%.1f%%",
-                        ),
-                    "Avg_ROM_%":
-                        st.column_config.NumberColumn(
-                            "Avg ROM",
-                            format="%.2f%%",
-                        ),
-                    "Median_ROM_%":
-                        st.column_config.NumberColumn(
-                            "Median ROM",
-                            format="%.2f%%",
-                        ),
-                    "Annualized_ROM_%":
-                        st.column_config.NumberColumn(
-                            "Annualized ROM",
-                            format="%.1f%%",
-                        ),
-                    "Profit_Factor":
-                        st.column_config.NumberColumn(
-                            "Profit Factor",
-                            format="%.2f",
-                        ),
-                    "Sharpe":
-                        st.column_config.NumberColumn(
-                            "Sharpe",
-                            format="%.2f",
-                        ),
-                    "Sortino":
-                        st.column_config.NumberColumn(
-                            "Sortino",
-                            format="%.2f",
-                        ),
-                    "Max_Drawdown_Normalized":
-                        st.column_config.NumberColumn(
-                            "Max DD / normalized ₹",
-                            format="₹%.2f",
-                        ),
-                    "Stop_Rate_%":
-                        st.column_config.NumberColumn(
-                            "Stop Rate",
-                            format="%.1f%%",
-                        ),
+                    "Win_Rate_Rank": st.column_config.NumberColumn("Win Rank", format="%d"),
+                    "Win_Rate_%": st.column_config.NumberColumn("Win Rate", format="%.1f%%"),
+                    "Net_PnL": st.column_config.NumberColumn("Net P&L", format="₹%.0f"),
+                    "Avg_PnL": st.column_config.NumberColumn("Avg P&L", format="₹%.0f"),
+                    "Median_PnL": st.column_config.NumberColumn("Median P&L", format="₹%.0f"),
+                    "Profit_Factor": st.column_config.NumberColumn("Profit Factor", format="%.2f"),
+                    "Avg_ROM_%": st.column_config.NumberColumn("Avg ROM", format="%.2f%%"),
+                    "Max_DD": st.column_config.NumberColumn("Max DD", format="₹%.0f"),
+                    "Stop_Rate_%": st.column_config.NumberColumn("Stop Rate", format="%.1f%%"),
                 },
             )
 
@@ -1082,10 +1383,7 @@ symbol = st.sidebar.selectbox(
 
 spec = FNO[symbol]
 
-data_mode = st.sidebar.radio(
-    "Pricing Data",
-    ["Theoretical / Yahoo", "Historical NSE Option CSV"],
-)
+data_mode = "NSE DIRECT"
 
 years = st.sidebar.slider(
     "Lookback Years", 1, 5, 3
@@ -1093,22 +1391,6 @@ years = st.sidebar.slider(
 
 y_pct = st.sidebar.slider(
     "OTM Distance (%)", 1.0, 15.0, 5.0, .5
-)
-
-lot = st.sidebar.number_input(
-    "Lot Size",
-    min_value=1,
-    max_value=20000,
-    value=int(spec["lot"]),
-    step=25,
-)
-
-step = st.sidebar.number_input(
-    "Strike Step ₹",
-    min_value=.5,
-    max_value=500.,
-    value=float(spec["step"]),
-    step=1.,
 )
 
 margin_pct = st.sidebar.slider(
@@ -1121,16 +1403,6 @@ stop_mult = st.sidebar.slider(
     0., 5., 2.5, .5
 )
 
-rf = st.sidebar.slider(
-    "Risk-Free Rate (%)",
-    4., 9., 6.75, .25
-)/100
-
-iv_markup = st.sidebar.slider(
-    "IV / Realized Vol",
-    1.0, 1.5, 1.15, .01
-)
-
 friction = st.sidebar.slider(
     "Turnover Friction (%)",
     0., 3., 1.2, .1
@@ -1139,75 +1411,45 @@ friction = st.sidebar.slider(
 st.sidebar.divider()
 
 st.sidebar.caption(
-    "The All-50 comparison normalizes lot size to 1. Individual-security strike intervals can change under NSE rules. The map here is a model default; use the latest NSE strike-scheme / contract master for live research.\n\nCurrent NSE contract specifications use Tuesday expiry for "
+    "The engine uses NSE contract metadata and observed historical option prices. No file upload is required.\n\nCurrent NSE contract specifications use Tuesday expiry for "
     "individual-security options, adjusted to the previous trading day "
     "when Tuesday is a holiday."
 )
 
 
 # ============================================================
-# DATA
+# DATA — NSE DIRECT ONLY
 # ============================================================
 
-nse_options = pd.DataFrame()
+mode_label = "NSE DIRECT — CONTRACT-WISE HISTORICAL"
 
-if data_mode == "Historical NSE Option CSV":
-    uploaded = st.sidebar.file_uploader(
-        "Upload NSE historical option CSV",
-        type=["csv"],
-        help="Upload contract-wise historical option data exported from NSE.",
+with st.spinner("Connecting to NSE and loading historical cash-market data..."):
+    ledger, data_status = nse_actual_backtest(
+        symbol=symbol,
+        years=years,
+        y_pct=y_pct,
+        stop_mult=stop_mult,
+        friction=friction,
+        margin_pct=margin_pct,
     )
 
-    if uploaded:
-        nse_options = parse_nse_csv(uploaded)
-
-        if nse_options.empty:
-            st.error(
-                "The CSV could not be mapped. Required fields: "
-                "date, expiry, option type, strike and close/settlement price."
-            )
-            st.stop()
-
-        st.sidebar.success(
-            f"{len(nse_options):,} option observations loaded"
-        )
-
-        # Historical mode currently displays the uploaded data and
-        # leaves strategy execution to the robust theoretical engine unless
-        # an exact contract-selection layer is enabled.
-        mode_label = "NSE CSV LOADED"
-    else:
-        mode_label = "WAITING FOR NSE CSV"
-else:
-    mode_label = "THEORETICAL MODEL"
-
-
-with st.spinner("Loading spot data..."):
-    spot = yahoo_data(symbol, years)
-
-if spot.empty:
-    st.error("Yahoo Finance spot data unavailable.")
-    st.stop()
-
-ledger = theoretical_backtest(
-    spot=spot,
-    y_pct=y_pct,
-    step=step,
-    lot=lot,
-    rf=rf,
-    iv_markup=iv_markup,
-    stop_mult=stop_mult,
-    friction=friction,
-    margin_pct=margin_pct,
-    years=years,
-)
+if not ledger.empty:
+    _spot_start = pd.to_datetime(ledger["Entry_Date"]).min().date()
+    _spot_end = pd.to_datetime(ledger["Exit_Date"]).max().date()
+    spot = nse_equity_history(symbol, _spot_start, _spot_end).copy()
+    if not spot.empty:
+        spot["Date"] = pd.to_datetime(spot["Date"])
+        spot = spot.set_index("Date")
 
 if ledger.empty:
-    st.warning("No complete strategy cycles were generated.")
+    st.error(
+        f"NSE did not return enough complete contract history for {symbol}. "
+        f"Status: {data_status}. NSE may limit historical F&O API retention; "
+        "try a shorter lookback. No synthetic option prices are substituted."
+    )
     st.stop()
 
 metrics = performance_metrics(ledger)
-
 
 # ============================================================
 # EQUITY FIELDS
@@ -1375,7 +1617,7 @@ with overview:
         figp.add_trace(
             go.Scatter(
                 x=ledger["Entry_Date"],
-                y=ledger["Spot_Entry"],
+                y=ledger["Entry_Spot"],
                 mode="markers",
                 name="Entry",
                 marker=dict(
@@ -1389,7 +1631,7 @@ with overview:
         figp.add_trace(
             go.Scatter(
                 x=ledger["Exit_Date"],
-                y=ledger["Spot_Exit"],
+                y=ledger["Exit_Spot"],
                 mode="markers",
                 name="Exit",
                 marker=dict(
@@ -1542,67 +1784,47 @@ with risk:
 
 
 # ============================================================
-# SENSITIVITY
+# SENSITIVITY — NSE DIRECT
 # ============================================================
 
 with sensitivity:
 
     st.markdown(
-        '<div class="section">OTM Distance × Stop-Loss Sensitivity</div>',
+        '<div class="section">NSE Contract-Priced Sensitivity</div>',
         unsafe_allow_html=True
     )
+    st.caption(
+        "Every cell reruns the selected stock against NSE historical option "
+        "contracts. There are no model option prices in this matrix."
+    )
 
-    y_grid = [2,3,4,5,6,7,8,10]
-    stop_grid = [1.5,2.0,2.5,3.0,3.5,4.0]
-
-    matrix = []
-
-    for yy in y_grid:
-        row = []
-        for ss in stop_grid:
-            test = theoretical_backtest(
-                spot,yy,step,lot,rf,iv_markup,ss,
-                friction,margin_pct,years
-            )
-            if test.empty:
-                row.append(np.nan)
-            else:
-                row.append(test["Net_PnL"].sum())
-        matrix.append(row)
-
-    f = go.Figure(
-        go.Heatmap(
-            z=matrix,
-            x=stop_grid,
-            y=y_grid,
-            colorscale=[
-                [0,RED],
-                [.5,"#202733"],
-                [1,GREEN],
-            ],
+    y_grid = [3, 5, 7]
+    stop_grid = [2.0, 2.5, 3.0]
+    run_sens = st.button("▶ Run 3×3 NSE Sensitivity", use_container_width=True)
+    if run_sens or "nse_sensitivity" in st.session_state:
+        if run_sens:
+            matrix = []
+            with st.spinner("Fetching NSE contracts for sensitivity grid..."):
+                for yy in y_grid:
+                    row = []
+                    for ss in stop_grid:
+                        test, _ = nse_actual_backtest(
+                            symbol, years, yy, ss, friction, margin_pct
+                        )
+                        row.append(test["Net_PnL"].sum() if not test.empty else np.nan)
+                    matrix.append(row)
+            st.session_state["nse_sensitivity"] = matrix
+        matrix = st.session_state["nse_sensitivity"]
+        f = go.Figure(go.Heatmap(
+            z=matrix, x=stop_grid, y=y_grid,
+            colorscale=[[0, RED], [.5, "#202733"], [1, GREEN]],
             colorbar=dict(title="Net P&L ₹"),
-            hovertemplate=(
-                "OTM %{y:.1f}%<br>"
-                "Stop %{x:.1f}x<br>"
-                "Net P&L ₹%{z:,.0f}"
-                "<extra></extra>"
-            ),
-        )
-    )
-
-    layout(f,450)
-    f.update_xaxes(title="Stop-Loss Multiple")
-    f.update_yaxes(title="OTM Distance")
-    st.plotly_chart(f,use_container_width=True,
-                    config={"displayModeBar":False})
-
-    st.info(
-        "Sensitivity is a parameter map, not an out-of-sample validation. "
-        "Use a separate training/validation period before treating a region "
-        "of the heatmap as robust."
-    )
-
-
+            hovertemplate="OTM %{y:.1f}%<br>Stop %{x:.1f}x<br>Net P&L ₹%{z:,.0f}<extra></extra>"
+        ))
+        layout(f, 420)
+        f.update_xaxes(title="Stop-Loss Multiple")
+        f.update_yaxes(title="OTM Distance")
+        st.plotly_chart(f, use_container_width=True, config={"displayModeBar": False})
 
 # ============================================================
 # ALL NIFTY 50 COMPARISON
@@ -1619,8 +1841,8 @@ with universe_tab:
         "Cross-sectional comparison uses the same strategy parameters for "
         "all constituents. Results are normalized to one unit of notional, "
         "so win rate is directly comparable across stocks. This is the "
-        "theoretical Black-Scholes engine unless historical option CSV data "
-        "is supplied and a historical-option execution layer is enabled."
+        "actual NSE contract-wise historical option prices. No upload, Yahoo "
+        "prices or Black-Scholes option estimates are used."
     )
 
     run_batch = st.button(
@@ -1635,12 +1857,10 @@ with universe_tab:
             with st.spinner(
                 "Running the strategy across all 50 Nifty constituents..."
             ):
-                st.session_state["nifty50_comparison"] = run_all_nifty50(
+                st.session_state["nifty50_comparison"] = run_all_nifty50_nse(
                     symbols=list(FNO.keys()),
                     years=years,
                     y_pct=y_pct,
-                    rf=rf,
-                    iv_markup=iv_markup,
                     stop_mult=stop_mult,
                     friction=friction,
                     margin_pct=margin_pct,
@@ -1655,7 +1875,7 @@ with universe_tab:
         if ok.empty:
             st.error(
                 "No constituent completed successfully. "
-                "Check Yahoo Finance connectivity."
+                "Check NSE connectivity, NSE rate limits, and the selected lookback window."
             )
         else:
 
@@ -2021,26 +2241,18 @@ with st.expander("Data, Pricing & Methodology"):
 
     st.markdown(
         """
-### Historical NSE mode
+### NSE direct mode
 
-The intended production workflow is:
+The dashboard now uses NSE directly and requires no upload.
 
-1. Export/download historical NSE contract-wise option data.
-2. Load the CSV into the dashboard.
-3. Select the exact symbol, expiry, strike and option type.
-4. Use actual historical option prices rather than Black-Scholes estimates.
-5. Add bid/ask or slippage assumptions.
-6. Recalculate margin from historical SPAN/ELM data where available.
+1. NSE historical equity API supplies the underlying close used on entry.
+2. NSE contract metadata supplies current permitted lot size and stock-option strike scheme.
+3. NSE historical F&O contract API supplies the actual OPTSTK CE/PE contract OHLC/close for the selected expiry and strike.
+4. The engine selects the nearest NSE strike to the configured OTM target and tries nearby official strike intervals if the historical strike scheme has changed.
+5. Stop-loss checks use the observed daily closing premium of the two short contracts.
+6. No Black-Scholes price is substituted when NSE data is missing.
 
-### Theoretical mode
-
-The fallback mode uses:
-
-`30-day realized volatility × IV markup`
-
-and Black-Scholes option valuation.
-
-This is a **model-based simulation**, not actual historical option execution.
+NSE states that individual-security options expire on the last Tuesday of the expiry month, adjusted to the previous trading day if Tuesday is a holiday, and that stock-option strike intervals are reviewed periodically based on underlying volatility.
 
 ### Risk analytics
 
